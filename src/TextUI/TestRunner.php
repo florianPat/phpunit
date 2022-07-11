@@ -9,6 +9,7 @@
  */
 namespace PHPUnit\TextUI;
 
+use PHPUnit\Framework\ParallelTestResult;
 use const PHP_EOL;
 use const PHP_SAPI;
 use const PHP_VERSION;
@@ -124,6 +125,8 @@ final class TestRunner extends BaseTestRunner
      */
     private $timer;
 
+    protected int $threadId = -1;
+
     public function __construct(TestSuiteLoader $loader = null, CodeCoverageFilter $filter = null)
     {
         if ($filter === null) {
@@ -140,8 +143,20 @@ final class TestRunner extends BaseTestRunner
      * @throws \PHPUnit\TextUI\XmlConfiguration\Exception
      * @throws Exception
      */
-    public function run(TestSuite $suite, array $arguments = [], array $warnings = [], bool $exit = true): TestResult
-    {
+    public function run(
+        TestSuite $suite,
+        array $arguments = [],
+        array $warnings = [],
+        bool $exit = true,
+        ?\parallel\Channel $channel = null,
+        array $testCaseList = [],
+        int $threadId = -1,
+        ?\parallel\Channel $outputChannel = null,
+        ?\parallel\Channel $prevChannel = null,
+        ?\parallel\Channel $nextChannel = null,
+    ): TestResult {
+        $this->threadId = $threadId;
+
         if (isset($arguments['configuration'])) {
             $GLOBALS['__PHPUNIT_CONFIGURATION_FILE'] = $arguments['configuration'];
         }
@@ -301,7 +316,7 @@ final class TestRunner extends BaseTestRunner
                         $reflector = new ReflectionClass($arguments['printer']);
 
                         if ($reflector->implementsInterface(ResultPrinter::class)) {
-                            $this->printer = $this->createPrinter($arguments['printer'], $arguments);
+                            $this->printer = $this->createPrinter($arguments['printer'], $arguments, $outputChannel, $threadId, $prevChannel, $nextChannel);
                         }
 
                         // @codeCoverageIgnoreStart
@@ -315,7 +330,7 @@ final class TestRunner extends BaseTestRunner
                     // @codeCoverageIgnoreEnd
                 }
             } else {
-                $this->printer = $this->createPrinter(DefaultResultPrinter::class, $arguments);
+                $this->printer = $this->createPrinter(DefaultResultPrinter::class, $arguments, $outputChannel, $threadId, $prevChannel, $nextChannel);
             }
         }
 
@@ -670,7 +685,23 @@ final class TestRunner extends BaseTestRunner
             $this->write(PHP_EOL);
         }
 
-        $suite->run($result);
+        if (0 === $threadId) {
+            $result->startTestSuite($suite);
+        }
+
+        $transactionFailedTestIndexes = [];
+
+        while (true) {
+            $testCaseItemIndex = $channel->recv();
+
+            if ($testCaseItemIndex === -1) {
+                break;
+            }
+
+            $this->printer->setCurrentTestIndex($testCaseItemIndex);
+            $testCaseList[$testCaseItemIndex]->run($result);
+        }
+        // $suite->run($result);
 
         foreach ($this->extensions as $extension) {
             if ($extension instanceof AfterLastTestHook) {
@@ -878,10 +909,12 @@ final class TestRunner extends BaseTestRunner
             $buffer = htmlspecialchars($buffer);
         }
 
-        if ($this->printer !== null) {
-            $this->printer->write($buffer);
-        } else {
-            print $buffer;
+        if (0 === $this->threadId) {
+            if ($this->printer !== null) {
+                $this->printer->write($buffer);
+            } else {
+                print $buffer;
+            }
         }
     }
 
@@ -1231,7 +1264,7 @@ final class TestRunner extends BaseTestRunner
         $this->messagePrinted = true;
     }
 
-    private function createPrinter(string $class, array $arguments): ResultPrinter
+    private function createPrinter(string $class, array $arguments, \parallel\Channel $outputChannel, int $threadId, \parallel\Channel $prevChannel, \parallel\Channel $nextChannel): ResultPrinter
     {
         $object = new $class(
             (isset($arguments['stderr']) && $arguments['stderr'] === true) ? 'php://stderr' : null,
@@ -1239,7 +1272,11 @@ final class TestRunner extends BaseTestRunner
             $arguments['colors'],
             $arguments['debug'],
             $arguments['columns'],
-            $arguments['reverseList']
+            $arguments['reverseList'],
+            $outputChannel,
+            $threadId,
+            $prevChannel,
+            $nextChannel,
         );
 
         assert($object instanceof ResultPrinter);

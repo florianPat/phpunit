@@ -41,6 +41,11 @@ use Throwable;
  */
 final class TestResult implements Countable
 {
+    protected const DOCTRINE_DEADLOCK_EXECPTION_MESSAGES = [
+        '1213 Deadlock found when trying to get lock; try restarting transaction',
+        '1305 SAVEPOINT DOCTRINE2_SAVEPOINT_',
+    ];
+
     /**
      * @var array
      */
@@ -308,12 +313,23 @@ final class TestResult implements Countable
                 $this->stop();
             }
         } else {
-            $this->recordError($test, $t);
+            $isDeadlockException = false;
+            foreach (self::DOCTRINE_DEADLOCK_EXECPTION_MESSAGES as $message) {
+                if (\str_contains((string) $t, $message)) {
+                    $isDeadlockException = true;
+                }
+            }
+            if ($isDeadlockException) {
+                $notifyMethod = 'addDeadlock';
+                $this->runTests -= count($test);
+            } else {
+                $this->recordError($test, $t);
 
-            $notifyMethod = 'addError';
+                $notifyMethod = 'addError';
 
-            if ($this->stopOnError || $this->stopOnFailure) {
-                $this->stop();
+                if ($this->stopOnError || $this->stopOnFailure) {
+                    $this->stop();
+                }
             }
         }
 
@@ -323,7 +339,9 @@ final class TestResult implements Countable
         }
 
         foreach ($this->listeners as $listener) {
-            $listener->{$notifyMethod}($test, $t, $time);
+            if (\method_exists($listener, $notifyMethod)) {
+                $listener->{$notifyMethod}($test, $t, $time);
+            }
         }
 
         $this->lastTestFailed = true;
@@ -384,16 +402,29 @@ final class TestResult implements Countable
                 $this->stop();
             }
         } else {
-            $this->failures[] = new TestFailure($test, $e);
-            $notifyMethod     = 'addFailure';
+            $isDeadlockException = false;
+            foreach (self::DOCTRINE_DEADLOCK_EXECPTION_MESSAGES as $message) {
+                if (\str_contains((string) $e, $message)) {
+                    $isDeadlockException = true;
+                }
+            }
+            if ($isDeadlockException) {
+                $notifyMethod = 'addDeadlock';
+                $this->runTests -= count($test);
+            } else {
+                $this->failures[] = new TestFailure($test, $e);
+                $notifyMethod     = 'addFailure';
 
-            if ($this->stopOnFailure || $this->stopOnDefect) {
-                $this->stop();
+                if ($this->stopOnFailure || $this->stopOnDefect) {
+                    $this->stop();
+                }
             }
         }
 
         foreach ($this->listeners as $listener) {
-            $listener->{$notifyMethod}($test, $e, $time);
+            if (\method_exists($listener, $notifyMethod)) {
+                $listener->{$notifyMethod}($test, $e, $time);
+            }
         }
 
         $this->lastTestFailed = true;
@@ -672,19 +703,19 @@ final class TestResult implements Countable
         }
 
         $collectCodeCoverage = $this->codeCoverage !== null &&
-                               !$test instanceof ErrorTestCase &&
-                               !$test instanceof WarningTestCase &&
-                               $isAnyCoverageRequired;
+            !$test instanceof ErrorTestCase &&
+            !$test instanceof WarningTestCase &&
+            $isAnyCoverageRequired;
 
         if ($collectCodeCoverage) {
             $this->codeCoverage->start($test);
         }
 
         $monitorFunctions = $this->beStrictAboutResourceUsageDuringSmallTests &&
-                            !$test instanceof ErrorTestCase &&
-                            !$test instanceof WarningTestCase &&
-                            $size === TestUtil::SMALL &&
-                            function_exists('xdebug_start_function_monitor');
+            !$test instanceof ErrorTestCase &&
+            !$test instanceof WarningTestCase &&
+            $size === TestUtil::SMALL &&
+            function_exists('xdebug_start_function_monitor');
 
         if ($monitorFunctions) {
             /* @noinspection ForgottenDebugOutputInspection */

@@ -9,6 +9,7 @@
  */
 namespace PHPUnit\TextUI;
 
+use SebastianBergmann\Timer\Duration;
 use const PHP_EOL;
 use function array_map;
 use function array_reverse;
@@ -80,6 +81,16 @@ class DefaultResultPrinter extends Printer implements ResultPrinter
     protected $lastTestFailed = false;
 
     /**
+     * @var bool
+     */
+    protected $lastTestDeadlock = false;
+
+    /**
+     * @var int
+     */
+    protected $currentTestIndex = 0;
+
+    /**
      * @var int
      */
     protected $numAssertions = 0;
@@ -134,6 +145,8 @@ class DefaultResultPrinter extends Printer implements ResultPrinter
      */
     private $timer;
 
+    protected array $state = [];
+
     /**
      * Constructor.
      *
@@ -142,9 +155,19 @@ class DefaultResultPrinter extends Printer implements ResultPrinter
      *
      * @throws Exception
      */
-    public function __construct($out = null, bool $verbose = false, string $colors = self::COLOR_DEFAULT, bool $debug = false, $numberOfColumns = 80, bool $reverse = false)
-    {
-        parent::__construct($out);
+    public function __construct(
+        $out = null,
+        bool $verbose = false,
+        string $colors = self::COLOR_DEFAULT,
+        bool $debug = false,
+        $numberOfColumns = 80,
+        bool $reverse = false,
+        ?\parallel\Channel $outputChannel = null,
+        protected int $threadId = -1,
+        protected ?\parallel\Channel $prevChannel = null,
+        protected ?\parallel\Channel $nextChannel = null,
+    ) {
+        parent::__construct($out, $outputChannel);
 
         if (!in_array($colors, self::AVAILABLE_COLORS, true)) {
             throw InvalidArgumentException::create(
@@ -182,6 +205,14 @@ class DefaultResultPrinter extends Printer implements ResultPrinter
 
     public function printResult(TestResult $result): void
     {
+        if ($this->threadId !== -1) {
+            $this->outputChannel->send([
+                'type' => 'end',
+            ]);
+
+            $this->state = $this->prevChannel->recv();
+        }
+
         $this->printHeader($result);
         $this->printErrors($result);
         $this->printWarnings($result);
@@ -194,6 +225,16 @@ class DefaultResultPrinter extends Printer implements ResultPrinter
         }
 
         $this->printFooter($result);
+    }
+
+    /**
+     * A deadlock occurred.
+     */
+    public function addDeadlock(Test $test, Throwable $t, float $time): void
+    {
+        $this->lastTestDeadlock = true;
+        $this->writeProgressWithColor('fg-yellow, bold', 'D');
+        $this->lastTestFailed = true;
     }
 
     /**
@@ -302,13 +343,16 @@ class DefaultResultPrinter extends Printer implements ResultPrinter
             $this->writeProgress('.');
         }
 
-        if ($test instanceof TestCase) {
-            $this->numAssertions += $test->getNumAssertions();
-        } elseif ($test instanceof PhptTestCase) {
-            $this->numAssertions++;
+        if (!$this->lastTestDeadlock) {
+            if ($test instanceof TestCase) {
+                $this->numAssertions += $test->getNumAssertions();
+            } elseif ($test instanceof PhptTestCase) {
+                $this->numAssertions++;
+            }
         }
 
         $this->lastTestFailed = false;
+        $this->lastTestDeadlock = false;
 
         if ($test instanceof TestCase && !$test->hasExpectationOnOutput()) {
             $this->write($test->getActualOutput());
@@ -318,6 +362,61 @@ class DefaultResultPrinter extends Printer implements ResultPrinter
     protected function printDefects(array $defects, string $type): void
     {
         $count = count($defects);
+
+        if ($this->threadId !== -1) {
+            if ($this->state['type'] !== 'defect' || $this->state['defectType'] !== $type) {
+                $this->state = [
+                    'type' => 'defect',
+                    'defectType' => $type,
+                    'count' => 0,
+                ];
+            }
+
+            $this->state['count'] += $count;
+            $this->nextChannel->send($this->state);
+            $this->state = $this->prevChannel->recv();
+
+            $count = $this->state['count'];
+
+            if ($count == 0) {
+                $this->nextChannel->send($this->state);
+                $this->state = $this->prevChannel->recv();
+
+                return;
+            }
+
+            if (!isset($this->state['i'])) {
+                if ($this->defectListPrinted) {
+                    $this->write("\n--\n\n");
+                }
+
+                $this->write(
+                    sprintf(
+                        "There %s %d %s%s:\n",
+                        ($count == 1) ? 'was' : 'were',
+                        $count,
+                        $type,
+                        ($count == 1) ? '' : 's'
+                    )
+                );
+
+                $this->state['i'] = 1;
+            }
+
+            $i = $this->state['i'];
+
+            foreach ($defects as $defect) {
+                $this->printDefect($defect, $i++);
+            }
+
+            $this->defectListPrinted = true;
+
+            $this->state['i'] = $i;
+            $this->nextChannel->send($this->state);
+            $this->state = $this->prevChannel->recv();
+
+            return;
+        }
 
         if ($count == 0) {
             return;
@@ -408,8 +507,59 @@ class DefaultResultPrinter extends Printer implements ResultPrinter
         $this->printDefects($result->skipped(), 'skipped test');
     }
 
+    // ---------------------------
+    // Copied from SebastianBergmann\Timer\ResourceUsageFormatter
+    /**
+     * @psalm-var array<string,int>
+     */
+    private const SIZES = [
+        'GB' => 1073741824,
+        'MB' => 1048576,
+        'KB' => 1024,
+    ];
+
+    private function bytesToString(int $bytes): string
+    {
+        foreach (self::SIZES as $unit => $value) {
+            if ($bytes >= $value) {
+                return sprintf('%.2f %s', $bytes >= 1024 ? $bytes / $value : $bytes, $unit);
+            }
+        }
+
+        return $bytes . ' byte' . ($bytes !== 1 ? 's' : '');
+    }
+    // ---------------------------
+
     protected function printHeader(TestResult $result): void
     {
+        if ($this->threadId !== -1) {
+            if ($this->state['type'] !== 'header') {
+                $this->state = [
+                    'type' => 'header',
+                    'duration' => 0,
+                    'memory' => 0,
+                ];
+            }
+            $lastDuration = $this->state['duration'];
+            $currentDuration = $this->timer->stop()->asNanoseconds();
+            if ($currentDuration > $lastDuration) {
+                $this->state['duration'] = $currentDuration;
+            }
+            $this->state['memory'] += memory_get_peak_usage(true);
+            $this->nextChannel->send($this->state);
+
+            $this->state = $this->prevChannel->recv();
+            if ($this->state['type'] === 'header') {
+                $this->write(PHP_EOL . PHP_EOL . sprintf(
+                        'Time: %s, Memory: %s',
+                        Duration::fromNanoseconds($this->state['duration'])->asString(),
+                        $this->bytesToString($this->state['memory']),
+                    ) . PHP_EOL . PHP_EOL);
+            }
+
+            return;
+        }
+
         if (count($result) > 0) {
             $this->write(PHP_EOL . PHP_EOL . (new ResourceUsageFormatter)->resourceUsage($this->timer->stop()) . PHP_EOL . PHP_EOL);
         }
@@ -417,6 +567,129 @@ class DefaultResultPrinter extends Printer implements ResultPrinter
 
     protected function printFooter(TestResult $result): void
     {
+        if (-1 !== $this->threadId) {
+            if ($this->state['type'] !== 'footer') {
+                $this->state = [
+                    'type' => 'footer',
+                    'finished' => false,
+                    'resultCount' => 0,
+                    'numAssertions' => 0,
+                    'wasSuccessfulAndNoTestIsRiskyOrSkippedOrIncomplete' => true,
+                    'wasSuccessful' => true,
+                    'allHarmless' => true,
+                    'errorCount' => 0,
+                    'failureCount' => 0,
+                    'warningCount' => 0,
+                    'skippedCount' => 0,
+                    'notImplementedCount' => 0,
+                    'riskyCount' => 0,
+                ];
+            }
+
+            $this->state['resultCount'] += count($result);
+            $this->state['numAssertions'] += $this->numAssertions;
+            $this->state['wasSuccessfulAndNoTestIsRiskyOrSkippedOrIncomplete'] = $this->state['wasSuccessfulAndNoTestIsRiskyOrSkippedOrIncomplete'] && $result->wasSuccessfulAndNoTestIsRiskyOrSkippedOrIncomplete();
+            $this->state['wasSuccessful'] = $this->state['wasSuccessful'] && $result->wasSuccessful();
+            $this->state['allHarmless'] = $this->state['allHarmless'] && $result->allHarmless();
+            $this->state['errorCount'] += $result->errorCount();
+            $this->state['failureCount'] += $result->failureCount();
+            $this->state['warningCount'] += $result->warningCount();
+            $this->state['skippedCount'] += $result->skippedCount();
+            $this->state['notImplementedCount'] += $result->notImplementedCount();
+            $this->state['riskyCount'] += $result->riskyCount();
+            $this->nextChannel->send($this->state);
+            $this->state = $this->prevChannel->recv();
+
+            if ($this->state['type'] !== 'footer') {
+                return;
+            }
+
+            if ($this->state['finished']) {
+                $this->nextChannel->send($this->state);
+                return;
+            }
+
+            if ($this->state['resultCount'] === 0) {
+                $this->writeWithColor(
+                    'fg-black, bg-yellow',
+                    'No tests executed!'
+                );
+
+                $this->state['finished'] = true;
+                $this->nextChannel->send($this->state);
+                return;
+            }
+
+            if ($this->state['wasSuccessfulAndNoTestIsRiskyOrSkippedOrIncomplete']) {
+                $this->writeWithColor(
+                    'fg-black, bg-green',
+                    sprintf(
+                        'OK (%d test%s, %d assertion%s)',
+                        $this->state['resultCount'],
+                        ($this->state['resultCount'] === 1) ? '' : 's',
+                        $this->state['numAssertions'],
+                        ($this->state['numAssertions'] === 1) ? '' : 's'
+                    )
+                );
+
+                $this->state['finished'] = true;
+                $this->nextChannel->send($this->state);
+                return;
+            }
+
+            $color = 'fg-black, bg-yellow';
+
+            if ($this->state['wasSuccessful']) {
+                if ($this->verbose || !$this->state['allHarmless']) {
+                    $this->write("\n");
+                }
+
+                $this->writeWithColor(
+                    $color,
+                    'OK, but incomplete, skipped, or risky tests!'
+                );
+            } else {
+                $this->write("\n");
+
+                if ($this->state['errorCount']) {
+                    $color = 'fg-white, bg-red';
+
+                    $this->writeWithColor(
+                        $color,
+                        'ERRORS!'
+                    );
+                } elseif ($this->state['failureCount']) {
+                    $color = 'fg-white, bg-red';
+
+                    $this->writeWithColor(
+                        $color,
+                        'FAILURES!'
+                    );
+                } elseif ($this->state['warningCount']) {
+                    $color = 'fg-black, bg-yellow';
+
+                    $this->writeWithColor(
+                        $color,
+                        'WARNINGS!'
+                    );
+                }
+            }
+
+            $this->writeCountString($this->state['resultCount'], 'Tests', $color, true);
+            $this->writeCountString($this->state['numAssertions'], 'Assertions', $color, true);
+            $this->writeCountString($this->state['errorCount'], 'Errors', $color);
+            $this->writeCountString($this->state['failureCount'], 'Failures', $color);
+            $this->writeCountString($this->state['warningCount'], 'Warnings', $color);
+            $this->writeCountString($this->state['skippedCount'], 'Skipped', $color);
+            $this->writeCountString($this->state['notImplementedCount'], 'Incomplete', $color);
+            $this->writeCountString($this->state['riskyCount'], 'Risky', $color);
+            $this->writeWithColor($color, '.');
+
+            $this->state['finished'] = true;
+            $this->nextChannel->send($this->state);
+            return;
+        }
+
         if (count($result) === 0) {
             $this->writeWithColor(
                 'fg-black, bg-yellow',
@@ -490,15 +763,26 @@ class DefaultResultPrinter extends Printer implements ResultPrinter
         $this->writeWithColor($color, '.');
     }
 
-    protected function writeProgress(string $progress): void
+    public function writeProgress(string $progress, bool $lastTestDeadlock = false): void
     {
+        if ($this->threadId !== -1) {
+            $this->outputChannel->send([
+                'type' => 'progress',
+                'progress' => $progress,
+                'testIndex' => $this->lastTestDeadlock ? $this->getCurrentTestIndex() : -1,
+            ]);
+            return;
+        }
+
         if ($this->debug) {
             return;
         }
 
         $this->write($progress);
         $this->column++;
-        $this->numTestsRun++;
+        if (!$this->lastTestDeadlock && !$lastTestDeadlock) {
+            $this->numTestsRun++;
+        }
 
         if ($this->column == $this->maxColumn || $this->numTestsRun == $this->numTests) {
             if ($this->numTestsRun == $this->numTests) {
@@ -588,5 +872,15 @@ class DefaultResultPrinter extends Printer implements ResultPrinter
 
             $first = false;
         }
+    }
+
+    public function getCurrentTestIndex(): int
+    {
+        return $this->currentTestIndex;
+    }
+
+    public function setCurrentTestIndex(int $currentTestIndex): void
+    {
+        $this->currentTestIndex = $currentTestIndex;
     }
 }

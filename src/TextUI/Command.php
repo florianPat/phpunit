@@ -9,6 +9,10 @@
  */
 namespace PHPUnit\TextUI;
 
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Util\Test;
+use SebastianBergmann\Timer\Duration;
+use SebastianBergmann\Timer\ResourceUsageFormatter;
 use const PATH_SEPARATOR;
 use const PHP_EOL;
 use const STDIN;
@@ -103,12 +107,228 @@ class Command
         }
     }
 
+    protected function buildTestCaseList(\PHPUnit\Framework\Test $test): array|TestCase
+    {
+        $result = [];
+
+        if ($test instanceof TestCase) {
+            return $test;
+        } else if ($test instanceof TestSuite) {
+            foreach ($test->tests() as $testInTest) {
+                $returned = $this->buildTestCaseList($testInTest);
+                if (\is_array($returned)) {
+                    foreach ($returned as $item) {
+                        $result[] = $item;
+                    }
+                } else {
+                    $result[] = $returned;
+                }
+            }
+        } else {
+            throw new \RuntimeException('Only TestSuite and TestCases are ever used!!! Or?! hehe...');
+        }
+
+        return $result;
+    }
+
     /**
      * @throws Exception
      */
     public function run(array $argv, bool $exit = true): int
     {
-        $this->handleArguments($argv);
+        $threads = [];
+        $futures = [];
+        $channels = [];
+        $outputChannel = new \parallel\Channel(\parallel\Channel::Infinite);
+        $workDistributorChannel = new \parallel\Channel(\parallel\Channel::Infinite);
+        $nCores = ((int) shell_exec('nproc'));
+        for($i = 0; $i < $nCores; ++$i) {
+            $threads[] = new \parallel\Runtime(PHPUNIT_COMPOSER_INSTALL);
+            $channels[] = (new \parallel\Channel())->make("$i", \parallel\Channel::Infinite);
+        }
+        $channel = new \parallel\Channel();
+
+        $arguments = $this->handleArgumentsBeforeThread($argv);
+
+        foreach ($threads as $i => $thread) {
+            $prevChannel = $channels[($i - 1) === -1 ? $nCores - 1 : $i - 1];
+            $nextChannel = $channels[$i];
+
+            $futures[] = $thread->run(function (
+                \parallel\Channel $channel,
+                string            $commandClassName,
+                int               $threadId,
+                bool              $exit,
+                \parallel\Channel $outputChannel,
+                \parallel\Channel $prevChannel,
+                \parallel\Channel $nextChannel,
+            ) {
+                $arguments = $channel->recv();
+
+                $GLOBALS['THREAD_ID'] = $threadId;
+
+                /** @var Command $command */
+                $command = new $commandClassName;
+                $shouldStop = $command->handleArgumentsInThread($arguments, $threadId);
+
+                $runner = $command->createRunner();
+
+                if ($command->arguments['test'] instanceof TestSuite) {
+                    $suite = $command->arguments['test'];
+                } else {
+                    $suite = $runner->getTest(
+                        $command->arguments['test'],
+                        $command->arguments['testSuffixes']
+                    );
+                }
+
+                $testCaseList = $command->buildTestCaseList($suite);
+
+                if ($threadId === 0) {
+                    if ($command->arguments['listGroups']) {
+                        return $command->handleListGroups($suite, $exit);
+                    }
+
+                    if ($command->arguments['listSuites']) {
+                        return $command->handleListSuites($exit);
+                    }
+
+                    if ($command->arguments['listTests']) {
+                        return $command->handleListTests($suite, $exit);
+                    }
+
+                    if ($command->arguments['listTestsXml']) {
+                        return $command->handleListTestsXml($suite, $this->arguments['listTestsXml'], $exit);
+                    }
+                } else {
+                    if ($command->arguments['listGroups']) {
+                        return TestRunner::SUCCESS_EXIT;
+                    }
+
+                    if ($command->arguments['listSuites']) {
+                        return TestRunner::SUCCESS_EXIT;
+                    }
+
+                    if ($command->arguments['listTests']) {
+                        return TestRunner::SUCCESS_EXIT;
+                    }
+
+                    if ($command->arguments['listTestsXml']) {
+                        return TestRunner::SUCCESS_EXIT;
+                    }
+                }
+
+                unset($command->arguments['test'], $command->arguments['testFile']);
+
+                try {
+                    $result = $runner->run($suite, $command->arguments, $command->warnings, $exit, $channel, $testCaseList, $threadId, $outputChannel, $prevChannel, $nextChannel);
+                } catch (Throwable $t) {
+                    print $t->getMessage() . PHP_EOL;
+                }
+
+                $return = TestRunner::FAILURE_EXIT;
+
+                if (isset($result) && $result->wasSuccessful()) {
+                    $return = TestRunner::SUCCESS_EXIT;
+                } elseif (!isset($result) || $result->errorCount() > 0) {
+                    $return = TestRunner::EXCEPTION_EXIT;
+                }
+
+                if ($exit) {
+                    exit($return);
+                }
+
+                return $return;
+
+            }, [$workDistributorChannel, static::class, $i, false, $outputChannel, $prevChannel, $nextChannel]);
+
+            $workDistributorChannel->send($arguments);
+        }
+
+        $this->handleArgumentsInThread($arguments, 0);
+
+        $runner = $this->createRunner();
+
+        if ($this->arguments['test'] instanceof TestSuite) {
+            $suite = $this->arguments['test'];
+        } else {
+            $suite = $runner->getTest(
+                $this->arguments['test'],
+                $this->arguments['testSuffixes']
+            );
+        }
+
+        $progressPrinter = new DefaultResultPrinter(
+            (isset($this->arguments['stderr']) && $this->arguments['stderr'] === true) ? 'php://stderr' : null,
+            false,
+            'auto',
+            false,
+            $this->arguments['columns'],
+        );
+        $progressPrinter->startTestSuite($suite);
+
+        $testCaseList = $this->buildTestCaseList($suite);
+        $testCaseListIndexes = \range(0, \count($testCaseList) - 1);
+        $shuffleResult = \shuffle($testCaseListIndexes);
+        if (false === $shuffleResult) {
+            throw new \RuntimeException('Could not shuffle the test cases!');
+        }
+        foreach ($testCaseListIndexes as $index) {
+            $workDistributorChannel->send($index);
+        }
+        for ($i = 0; $i < (\count($channels) - 1); ++$i) {
+            $workDistributorChannel->send(-1);
+        }
+
+        $endStreamCount = 0;
+        while($value = $outputChannel->recv()) {
+            switch($value['type']) {
+                case 'progress': {
+                    $lastTestDeadlock = $value['testIndex'] !== -1;
+                    $progressPrinter->writeProgress($value['progress'], $lastTestDeadlock);
+                    if ($lastTestDeadlock) {
+                        $workDistributorChannel->send($value['testIndex']);
+                    }
+                    break;
+                }
+                case 'end': {
+                    $endStreamCount++;
+                    if ($endStreamCount === ($nCores - 1)) {
+                        $workDistributorChannel->send(-1);
+                    }
+                    if ($endStreamCount === $nCores) {
+                        break 2;
+                    }
+                    break;
+                }
+            }
+        }
+
+        $channels[0]->send([
+            'type' => 'unknown',
+        ]);
+
+        $exitCodes = [];
+        foreach ($futures as $future) {
+            $exitCodes[] = $future->value();
+        }
+
+        $return = TestRunner::SUCCESS_EXIT;
+
+        foreach ($exitCodes as $exitCode) {
+            if ($exitCode > $return) {
+                $return = $exitCode;
+            }
+        }
+
+        if ($exit) {
+            exit($return);
+        }
+
+        return $return;
+
+        die;
+        $this->handleArgumentsInThread($arguments);
 
         $runner = $this->createRunner();
 
@@ -213,7 +433,7 @@ class Command
      *
      * @throws Exception
      */
-    protected function handleArguments(array $argv): void
+    protected function handleArgumentsBeforeThread(array $argv): Configuration
     {
         try {
             $arguments = (new Builder)->fromParameters($argv, array_keys($this->longOptions));
@@ -260,6 +480,11 @@ class Command
             );
         }
 
+        return $arguments;
+    }
+
+    protected function handleArgumentsInThread(Configuration $arguments, int $threadId = 0): void
+    {
         if ($arguments->hasIniSettings()) {
             foreach ($arguments->iniSettings() as $name => $value) {
                 ini_set($name, $value);
@@ -316,13 +541,17 @@ class Command
         }
 
         if ($arguments->hasMigrateConfiguration() && $arguments->migrateConfiguration()) {
-            if (!isset($this->arguments['configuration'])) {
-                print 'No configuration file found to migrate.' . PHP_EOL;
+            if ($threadId === 0) {
+                if (!isset($this->arguments['configuration'])) {
+                    print 'No configuration file found to migrate.' . PHP_EOL;
 
-                exit(TestRunner::EXCEPTION_EXIT);
+                    exit(TestRunner::EXCEPTION_EXIT);
+                }
+
+                $this->migrateConfiguration(realpath($this->arguments['configuration']));
+            } else {
+                exit(TestRunner::SUCCESS_EXIT);
             }
-
-            $this->migrateConfiguration(realpath($this->arguments['configuration']));
         }
 
         if (isset($this->arguments['configuration'])) {
@@ -410,7 +639,9 @@ class Command
         }
 
         if (!isset($this->arguments['test'])) {
-            $this->showHelp();
+            if ($threadId === 0) {
+                $this->showHelp();
+            }
 
             exit(TestRunner::EXCEPTION_EXIT);
         }

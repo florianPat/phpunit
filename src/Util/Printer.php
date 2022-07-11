@@ -48,7 +48,7 @@ class Printer
      *
      * @throws Exception
      */
-    public function __construct($out = null)
+    public function __construct($out = null, protected ?\parallel\Channel $outputChannel = null)
     {
         if (is_resource($out)) {
             $this->stream = $out;
