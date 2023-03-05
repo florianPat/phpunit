@@ -87,6 +87,13 @@ final class Registry
         return self::$instance;
     }
 
+    public static function set(Configuration $self): Configuration
+    {
+        self::$instance = $self;
+
+        return self::$instance;
+    }
+
     /**
      * @throws \PHPUnit\TextUI\CliArguments\Exception
      * @throws \PHPUnit\TextUI\XmlConfiguration\Exception

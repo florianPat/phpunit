@@ -96,6 +96,20 @@ final class Facade
         return $dispatcher;
     }
 
+    public function initForParallel(\parallel\Channel $eventDispatcherChannel): ParallelDispatcher
+    {
+        $dispatcher = new ParallelDispatcher($eventDispatcherChannel);
+
+        $this->emitter = new DispatchingEmitter(
+            $dispatcher,
+            self::createTelemetrySystem(),
+        );
+
+        $this->sealed = true;
+
+        return $dispatcher;
+    }
+
     public function forward(EventCollection $events): void
     {
         if ($this->suspended !== null) {

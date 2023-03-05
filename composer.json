@@ -67,7 +67,8 @@
             "src/"
         ],
         "files": [
-            "src/Framework/Assert/Functions.php"
+            "src/Framework/Assert/Functions.php",
+            "src/TextUI/ParallelBootstrap.php"
         ]
     },
     "autoload-dev": {

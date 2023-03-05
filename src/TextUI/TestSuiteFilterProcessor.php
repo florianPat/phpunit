@@ -34,54 +34,55 @@ final class TestSuiteFilterProcessor
      */
     public function process(Configuration $configuration, TestSuite $suite): void
     {
-        if (!$configuration->hasFilter() &&
-            !$configuration->hasGroups() &&
-            !$configuration->hasExcludeGroups() &&
-            !$configuration->hasTestsCovering() &&
-            !$configuration->hasTestsUsing()) {
-            return;
-        }
+        if ($configuration->hasFilter() ||
+            $configuration->hasGroups() ||
+            $configuration->hasExcludeGroups() ||
+            $configuration->hasTestsCovering() ||
+            $configuration->hasTestsUsing()) {
+            if ($configuration->hasExcludeGroups()) {
+                $this->filterFactory->addExcludeGroupFilter(
+                    $configuration->excludeGroups()
+                );
+            }
 
-        if ($configuration->hasExcludeGroups()) {
-            $this->filterFactory->addExcludeGroupFilter(
-                $configuration->excludeGroups()
+            if ($configuration->hasGroups()) {
+                $this->filterFactory->addIncludeGroupFilter(
+                    $configuration->groups()
+                );
+            }
+
+            if ($configuration->hasTestsCovering()) {
+                $this->filterFactory->addIncludeGroupFilter(
+                    array_map(
+                        static fn (string $name): string => '__phpunit_covers_' . $name,
+                        $configuration->testsCovering()
+                    )
+                );
+            }
+
+            if ($configuration->hasTestsUsing()) {
+                $this->filterFactory->addIncludeGroupFilter(
+                    array_map(
+                        static fn (string $name): string => '__phpunit_uses_' . $name,
+                        $configuration->testsUsing()
+                    )
+                );
+            }
+
+            if ($configuration->hasFilter()) {
+                $this->filterFactory->addNameFilter(
+                    $configuration->filter()
+                );
+            }
+
+            $suite->injectFilter($this->filterFactory);
+
+            Event\Facade::emitter()->testSuiteFiltered(
+                Event\TestSuite\TestSuiteBuilder::from($suite)
             );
         }
 
-        if ($configuration->hasGroups()) {
-            $this->filterFactory->addIncludeGroupFilter(
-                $configuration->groups()
-            );
-        }
-
-        if ($configuration->hasTestsCovering()) {
-            $this->filterFactory->addIncludeGroupFilter(
-                array_map(
-                    static fn (string $name): string => '__phpunit_covers_' . $name,
-                    $configuration->testsCovering()
-                )
-            );
-        }
-
-        if ($configuration->hasTestsUsing()) {
-            $this->filterFactory->addIncludeGroupFilter(
-                array_map(
-                    static fn (string $name): string => '__phpunit_uses_' . $name,
-                    $configuration->testsUsing()
-                )
-            );
-        }
-
-        if ($configuration->hasFilter()) {
-            $this->filterFactory->addNameFilter(
-                $configuration->filter()
-            );
-        }
-
+        $this->filterFactory->addParallelFilter();
         $suite->injectFilter($this->filterFactory);
-
-        Event\Facade::emitter()->testSuiteFiltered(
-            Event\TestSuite\TestSuiteBuilder::from($suite)
-        );
     }
 }

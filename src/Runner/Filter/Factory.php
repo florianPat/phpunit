@@ -46,6 +46,17 @@ final class Factory
         ];
     }
 
+    public function addParallelFilter(): void
+    {
+        $this->filters[] = [
+            new ReflectionClass(ParallelFilter::class),
+            [
+                'THREAD_ID' => $GLOBALS['THREAD_ID'],
+                'N_CORES'   => $GLOBALS['N_CORES'],
+            ],
+        ];
+    }
+
     public function factory(Iterator $iterator, TestSuite $suite): FilterIterator
     {
         foreach ($this->filters as $filter) {

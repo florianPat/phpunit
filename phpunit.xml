@@ -48,4 +48,10 @@
 
         <const name="PHPUNIT_TESTSUITE" value="true"/>
     </php>
+
+    <extensions>
+        <bootstrap class="PHPUnit\ParallelExtension\ParallelExtensionBootstrap">
+            <parameter name="nCores" value="2"/>
+        </bootstrap>
+    </extensions>
 </phpunit>
