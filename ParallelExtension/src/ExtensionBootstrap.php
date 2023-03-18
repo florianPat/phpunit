@@ -8,7 +8,7 @@ use PHPUnit\Runner\Extension\Facade;
 use PHPUnit\Runner\Extension\ParameterCollection;
 use PHPUnit\TextUI\Configuration\Configuration;
 
-final class ParallelExtensionBootstrap implements Extension
+final class ExtensionBootstrap implements Extension
 {
     private const PHP_EXTENSION = 'parallel';
 
@@ -22,6 +22,8 @@ final class ParallelExtensionBootstrap implements Extension
             $nCores = (int) $parameters->get('nCores');
             $extensionParameters['nCores'] = $parameters->get('nCores');
         }
+
+        require_once __DIR__ . '/ParallelBootstrap.php';
 
         $app = new Application($nCores);
         exit($app->run($configuration, self::class, $extensionParameters));

@@ -73,6 +73,14 @@ use Throwable;
  */
 final class Application
 {
+    private int $nCores;
+
+    public function __construct()
+    {
+        $this->nCores = ((int) shell_exec('nproc'));
+        $this->nCores = 2;
+    }
+
     public function run(array $argv): int
     {
         try {
@@ -122,6 +130,7 @@ final class Application
             $this->writeRuntimeInformation($printer, $configuration);
             $this->writePharExtensionInformation($printer, $pharExtensions);
             $this->writeRandomSeedInformation($printer, $configuration);
+            $this->writeCoreInformation($printer);
 
             $printer->print(PHP_EOL);
 
@@ -138,13 +147,105 @@ final class Application
             $timer = new Timer;
             $timer->start();
 
-            $runner = new TestRunner;
+            $threads      = [];
+            $futures      = [];
+            $readChannels = [];
 
-            $runner->run(
-                $configuration,
-                $resultCache,
-                $testSuite
-            );
+            for ($i = 0; $i < $this->nCores; $i++) {
+                $threads[] = new \parallel\Runtime(PHPUNIT_COMPOSER_INSTALL);
+            }
+
+            $serializedConfiguration = \serialize($configuration);
+
+            foreach ($threads as $i => $thread) {
+                $readChannels[] = $eventDispatcherChannel = new \parallel\Channel;
+
+                $futures[] = $thread->run(
+                    static function (\parallel\Channel $eventDispatcherChannel, int $threadId, int $nCores) use ($serializedConfiguration, $resultCache)
+                    {
+                        $configuration = \unserialize($serializedConfiguration);
+
+                        $GLOBALS['THREAD_ID'] = $threadId;
+                        $GLOBALS['N_CORES']   = $nCores;
+
+                        // NOTE: Run bootstrapping again in new thread
+                        Registry::set($configuration);
+                        (new PhpHandler)->handle($configuration->php());
+
+                        if ($configuration->hasBootstrap()) {
+                            self::loadBootstrapScript($configuration->bootstrap());
+                        }
+                        $testSuite = self::buildTestSuite($configuration);
+
+                        if (!$configuration->noExtensions()) {
+                            self::bootstrapExtensions($configuration);
+                        }
+                        CodeCoverage::instance()->init($configuration, CodeCoverageFilterRegistry::instance());
+                        // NOTE: We do not init the output facade to not get output :)
+                        //OutputFacade::init($configuration);
+                        TestResultFacade::init();
+                        EventFacade::seal();
+                        EventFacade::initForParallel($eventDispatcherChannel);
+
+                        $runner = new TestRunner;
+                        $runner->run(
+                            $configuration,
+                            $resultCache,
+                            $testSuite
+                        );
+
+                        if (!CodeCoverage::instance()->isActive()) {
+                            return null;
+                        }
+
+                        return serialize(CodeCoverage::instance()->codeCoverage());
+                    },
+                    [$eventDispatcherChannel, $i, $this->nCores]
+                );
+            }
+
+            $testRunnerFinished = $this->nCores;
+
+            $events = new \parallel\Events;
+            $events->setBlocking(true);
+
+            foreach ($readChannels as $readChannel) {
+                $events->addChannel($readChannel);
+            }
+
+            for ($i = 0; $i < count($futures); $i++) {
+                $events->addFuture(sprintf('future_%d', $i), $futures[$i]);
+            }
+
+            while (0 !== $testRunnerFinished) {
+                $event = $events->poll();
+
+                if (str_starts_with($event->source, 'future')) {
+                    $testRunnerFinished--;
+
+                    if (null === $event->value) {
+                        continue;
+                    }
+
+                    $coverage = unserialize($event->value);
+                    assert($coverage instanceof \SebastianBergmann\CodeCoverage\CodeCoverage);
+                    CodeCoverage::instance()->codeCoverage()->merge($coverage);
+                }
+
+                assert(null !== $event);
+                $events->addChannel($event->object);
+                $eventCollection = unserialize($event->value);
+
+                EventFacade::forward($eventCollection);
+            }
+
+            foreach ($readChannels as $readChannel) {
+                $readChannel->close();
+            }
+
+            foreach ($threads as $thread) {
+                $thread->close();
+            }
 
             $duration = $timer->stop();
 
@@ -228,7 +329,7 @@ final class Application
         exit(Result::CRASH);
     }
 
-    private function exitWithErrorMessage(string $message): never
+    private static function exitWithErrorMessage(string $message): never
     {
         print Version::getVersionString() . PHP_EOL . PHP_EOL . $message . PHP_EOL;
 
@@ -246,10 +347,10 @@ final class Application
         exit($result->shellExitCode());
     }
 
-    private function loadBootstrapScript(string $filename): void
+    private static function loadBootstrapScript(string $filename): void
     {
         if (!is_readable($filename)) {
-            $this->exitWithErrorMessage(
+            self::exitWithErrorMessage(
                 sprintf(
                     'Cannot open bootstrap script "%s"',
                     $filename
@@ -260,7 +361,7 @@ final class Application
         try {
             include_once $filename;
         } catch (Throwable $t) {
-            $this->exitWithErrorMessage(
+            self::exitWithErrorMessage(
                 sprintf(
                     'Error in bootstrap script: %s:%s%s%s%s',
                     $t::class,
@@ -299,16 +400,16 @@ final class Application
         }
     }
 
-    private function buildTestSuite(Configuration $configuration): TestSuite
+    private static function buildTestSuite(Configuration $configuration): TestSuite
     {
         try {
             return (new TestSuiteBuilder)->build($configuration);
         } catch (Exception $e) {
-            $this->exitWithErrorMessage($e->getMessage());
+            self::exitWithErrorMessage($e->getMessage());
         }
     }
 
-    private function bootstrapExtensions(Configuration $configuration): void
+    private static function bootstrapExtensions(Configuration $configuration): void
     {
         $extensionBootstrapper = new ExtensionBootstrapper(
             $configuration,
@@ -322,7 +423,7 @@ final class Application
                     $bootstrapper['parameters']
                 );
             } catch (\PHPUnit\Runner\Exception $e) {
-                $this->exitWithErrorMessage(
+                self::exitWithErrorMessage(
                     sprintf(
                         'Error while bootstrapping extension: %s',
                         $e->getMessage()
@@ -468,6 +569,15 @@ final class Application
                 (string) $configuration->randomOrderSeed()
             );
         }
+    }
+
+    private function writeCoreInformation(Printer $printer): void
+    {
+        $this->writeMessage(
+            $printer,
+            'Cores',
+            (string) $this->nCores,
+        );
     }
 
     /**

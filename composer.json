@@ -47,7 +47,8 @@
         "sebastian/object-enumerator": "^5.0",
         "sebastian/recursion-context": "^5.0",
         "sebastian/type": "^4.0",
-        "sebastian/version": "^4.0"
+        "sebastian/version": "^4.0",
+        "symfony/finder": "^6.2"
     },
     "config": {
         "platform": {
@@ -68,8 +69,11 @@
         ],
         "files": [
             "src/Framework/Assert/Functions.php",
-            "src/TextUI/ParallelBootstrap.php"
-        ]
+            "ParallelExtension/src/ParallelBootstrap.php"
+        ],
+        "psr-4": {
+            "ParallelExtension\\": "ParallelExtension/src"
+        }
     },
     "autoload-dev": {
         "classmap": [

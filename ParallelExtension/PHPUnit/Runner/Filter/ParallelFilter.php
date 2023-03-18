@@ -10,11 +10,11 @@ declare(strict_types=1);
  */
 namespace PHPUnit\Runner\Filter;
 
-use function array_key_exists;
-use function assert;
 use PHPUnit\Framework\TestSuite;
 use RecursiveFilterIterator;
 use RecursiveIterator;
+use function array_key_exists;
+use function assert;
 
 final class ParallelFilter extends RecursiveFilterIterator
 {

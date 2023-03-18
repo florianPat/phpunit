@@ -50,7 +50,7 @@
     </php>
 
     <extensions>
-        <bootstrap class="PHPUnit\ParallelExtension\ParallelExtensionBootstrap">
+        <bootstrap class="ParallelExtension\ExtensionBootstrap">
             <parameter name="nCores" value="2"/>
         </bootstrap>
     </extensions>
