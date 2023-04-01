@@ -184,8 +184,8 @@ final class Application
                         // NOTE: We do not init the output facade to not get output :)
                         //OutputFacade::init($configuration);
                         TestResultFacade::init();
-                        EventFacade::seal();
-                        EventFacade::initForParallel($eventDispatcherChannel);
+                        EventFacade::instance()->seal();
+                        EventFacade::instance()->initForParallel($eventDispatcherChannel);
 
                         $runner = new TestRunner;
                         $runner->run(
@@ -236,7 +236,7 @@ final class Application
                 $events->addChannel($event->object);
                 $eventCollection = unserialize($event->value);
 
-                EventFacade::forward($eventCollection);
+                EventFacade::instance()->forward($eventCollection);
             }
 
             foreach ($readChannels as $readChannel) {

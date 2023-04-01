@@ -9,7 +9,21 @@
  */
 namespace ParallelExtension;
 
+use PHPUnit\TextUI\Command;
+use PHPUnit\TextUI\Exception;
+use PHPUnit\TextUI\ShellExitCodeCalculator;
+use PHPUnit\TextUI\TestRunner;
+use const PHP_EOL;
+use function is_file;
+use function is_readable;
+use function printf;
+use function realpath;
+use function sprintf;
+use function trim;
+use function unlink;
+use PHPUnit\Event\EventFacadeIsSealedException;
 use PHPUnit\Event\Facade as EventFacade;
+use PHPUnit\Event\UnknownSubscriberTypeException;
 use PHPUnit\Framework\TestSuite;
 use PHPUnit\Logging\EventLogger;
 use PHPUnit\Logging\JUnit\JunitXmlLogger;
@@ -31,7 +45,6 @@ use PHPUnit\TestRunner\TestResult\Facade as TestResultFacade;
 use PHPUnit\TextUI\CliArguments\Builder;
 use PHPUnit\TextUI\CliArguments\Configuration as CliConfiguration;
 use PHPUnit\TextUI\CliArguments\Exception as ArgumentsException;
-use PHPUnit\TextUI\Command;
 use PHPUnit\TextUI\Command\AtLeastVersionCommand;
 use PHPUnit\TextUI\Command\GenerateConfigurationCommand;
 use PHPUnit\TextUI\Command\ListGroupsCommand;
@@ -49,32 +62,15 @@ use PHPUnit\TextUI\Configuration\Configuration;
 use PHPUnit\TextUI\Configuration\PhpHandler;
 use PHPUnit\TextUI\Configuration\Registry;
 use PHPUnit\TextUI\Configuration\TestSuiteBuilder;
-use PHPUnit\TextUI\Exception;
 use PHPUnit\TextUI\Output\DefaultPrinter;
 use PHPUnit\TextUI\Output\Facade as OutputFacade;
 use PHPUnit\TextUI\Output\Printer;
-use PHPUnit\TextUI\ShellExitCodeCalculator;
-use PHPUnit\TextUI\TestRunner;
 use PHPUnit\TextUI\XmlConfiguration\Configuration as XmlConfiguration;
 use PHPUnit\TextUI\XmlConfiguration\DefaultConfiguration;
 use PHPUnit\TextUI\XmlConfiguration\Loader;
 use SebastianBergmann\Timer\Timer;
 use Throwable;
-use function assert;
-use function count;
-use function is_file;
-use function is_readable;
-use function printf;
-use function realpath;
-use function serialize;
-use function shell_exec;
-use function sprintf;
-use function str_starts_with;
-use function trim;
-use function unlink;
-use function unserialize;
-use const PHP_EOL;
-use const PHPUNIT_COMPOSER_INSTALL;
+use PHPUnit\Event;
 
 /**
  * @internal This class is not covered by the backward compatibility promise for PHPUnit
@@ -90,7 +86,7 @@ final class Application
 
     public function run(Configuration $configuration, string $extensionClassName, array $extensionParameters): int
     {
-        EventFacade::emitter()->testRunnerBootstrappedExtension(
+        EventFacade::instance()->emitter()->testRunnerBootstrappedExtension(
             $extensionClassName,
             $extensionParameters,
         );
@@ -127,7 +123,7 @@ final class Application
 
             $resultCache = $this->initializeTestResultCache($configuration);
 
-            EventFacade::seal();
+            EventFacade::instance()->seal();
 
             $timer = new Timer;
             $timer->start();
@@ -169,8 +165,8 @@ final class Application
                         // NOTE: We do not init the output facade to not get output :)
                         //OutputFacade::init($configuration);
                         TestResultFacade::init();
-                        EventFacade::seal();
-                        EventFacade::initForParallel($eventDispatcherChannel);
+                        EventFacade::instance()->seal();
+                        EventFacade::instance()->initForParallel($eventDispatcherChannel);
 
                         $runner = new TestRunner;
                         $runner->run(
@@ -202,6 +198,7 @@ final class Application
                 $events->addFuture(sprintf('future_%d', $i), $futures[$i]);
             }
 
+            $testRunnerExecutionFinishedEvent = null;
             while (0 !== $testRunnerFinished) {
                 $event = $events->poll();
 
@@ -215,14 +212,34 @@ final class Application
                     $coverage = unserialize($event->value);
                     assert($coverage instanceof \SebastianBergmann\CodeCoverage\CodeCoverage);
                     CodeCoverage::instance()->codeCoverage()->merge($coverage);
+                    continue;
                 }
 
                 assert(null !== $event);
                 $events->addChannel($event->object);
                 $eventCollection = unserialize($event->value);
 
-                EventFacade::forward($eventCollection);
+                foreach ($eventCollection->asArray() as $event) {
+                    if ($event instanceof Event\TestRunner\ExecutionFinished) {
+                        $testRunnerExecutionFinishedEvent = $event;
+                        $newEventCollection = new Event\EventCollection();
+                        $newEventCollection->add(
+                            ...\array_filter(
+                                $eventCollection->asArray(),
+                                fn (Event\Event $event) => !($event instanceof Event\TestRunner\ExecutionFinished),
+                            ),
+                        );
+                        $eventCollection = $newEventCollection;
+                        break;
+                    }
+                }
+
+                EventFacade::instance()->forward($eventCollection);
             }
+
+            $eventCollection = new Event\EventCollection();
+            $eventCollection->add($testRunnerExecutionFinishedEvent);
+            EventFacade::instance()->forward($eventCollection);
 
             foreach ($readChannels as $readChannel) {
                 $readChannel->close();
@@ -268,7 +285,7 @@ final class Application
                 $result
             );
 
-            EventFacade::emitter()->applicationFinished($shellExitCode);
+            EventFacade::instance()->emitter()->applicationFinished($shellExitCode);
 
             return $shellExitCode;
         } catch (Throwable $t) {
@@ -314,6 +331,13 @@ final class Application
         exit(Result::CRASH);
     }
 
+    private static function exitWithErrorMessage(string $message): never
+    {
+        print Version::getVersionString() . PHP_EOL . PHP_EOL . $message . PHP_EOL;
+
+        exit(Result::EXCEPTION);
+    }
+
     private function execute(Command\Command $command): never
     {
         print Version::getVersionString() . PHP_EOL . PHP_EOL;
@@ -323,6 +347,35 @@ final class Application
         print $result->output();
 
         exit($result->shellExitCode());
+    }
+
+    private static function loadBootstrapScript(string $filename): void
+    {
+        if (!is_readable($filename)) {
+            self::exitWithErrorMessage(
+                sprintf(
+                    'Cannot open bootstrap script "%s"',
+                    $filename
+                )
+            );
+        }
+
+        try {
+            include_once $filename;
+        } catch (Throwable $t) {
+            self::exitWithErrorMessage(
+                sprintf(
+                    'Error in bootstrap script: %s:%s%s%s%s',
+                    $t::class,
+                    PHP_EOL,
+                    $t->getMessage(),
+                    PHP_EOL,
+                    $t->getTraceAsString()
+                )
+            );
+        }
+
+        EventFacade::instance()->emitter()->testRunnerBootstrapFinished($filename);
     }
 
     private function buildCliConfiguration(array $argv): CliConfiguration
@@ -346,6 +399,45 @@ final class Application
             return (new Loader)->load($configurationFile);
         } catch (Throwable $e) {
             $this->exitWithErrorMessage($e->getMessage());
+        }
+    }
+
+    private static function buildTestSuite(Configuration $configuration): TestSuite
+    {
+        try {
+            return (new TestSuiteBuilder)->build($configuration);
+        } catch (Exception $e) {
+            self::exitWithErrorMessage($e->getMessage());
+        }
+    }
+
+    private static function bootstrapExtensions(Configuration $configuration, string $extensionClassName, bool $skipTillExtension): void
+    {
+        $extensionBootstrapper = new ExtensionBootstrapper(
+            $configuration,
+            new ExtensionFacade
+        );
+
+        $seenExtensionClassName = $skipTillExtension;
+        foreach ($configuration->extensionBootstrappers() as $bootstrapper) {
+            if (!$seenExtensionClassName || $bootstrapper['className'] === $extensionClassName) {
+                $seenExtensionClassName = true;
+                continue;
+            }
+
+            try {
+                $extensionBootstrapper->bootstrap(
+                    $bootstrapper['className'],
+                    $bootstrapper['parameters']
+                );
+            } catch (\PHPUnit\Runner\Exception $e) {
+                self::exitWithErrorMessage(
+                    sprintf(
+                        'Error while bootstrapping extension: %s',
+                        $e->getMessage()
+                    )
+                );
+            }
         }
     }
 
@@ -496,6 +588,10 @@ final class Application
         );
     }
 
+    /**
+     * @throws EventFacadeIsSealedException
+     * @throws UnknownSubscriberTypeException
+     */
     private function registerLogfileWriters(Configuration $configuration): void
     {
         if ($configuration->hasLogEventsText()) {
@@ -503,7 +599,7 @@ final class Application
                 unlink($configuration->logEventsText());
             }
 
-            EventFacade::registerTracer(
+            EventFacade::instance()->registerTracer(
                 new EventLogger(
                     $configuration->logEventsText(),
                     false
@@ -516,7 +612,7 @@ final class Application
                 unlink($configuration->logEventsVerboseText());
             }
 
-            EventFacade::registerTracer(
+            EventFacade::instance()->registerTracer(
                 new EventLogger(
                     $configuration->logEventsVerboseText(),
                     true
@@ -527,6 +623,7 @@ final class Application
         if ($configuration->hasLogfileJunit()) {
             new JunitXmlLogger(
                 OutputFacade::printerFor($configuration->logfileJunit()),
+                EventFacade::instance()
             );
         }
 
@@ -534,107 +631,41 @@ final class Application
             new TeamCityLogger(
                 DefaultPrinter::from(
                     $configuration->logfileTeamcity()
-                )
+                ),
+                EventFacade::instance()
             );
         }
     }
 
+    /**
+     * @throws EventFacadeIsSealedException
+     * @throws UnknownSubscriberTypeException
+     */
     private function testDoxResultCollector(Configuration $configuration): ?TestDoxResultCollector
     {
         if ($configuration->hasLogfileTestdoxHtml() ||
             $configuration->hasLogfileTestdoxText() ||
             $configuration->outputIsTestDox()) {
-            return new TestDoxResultCollector;
+            return new TestDoxResultCollector(EventFacade::instance());
         }
 
         return null;
     }
 
+    /**
+     * @throws EventFacadeIsSealedException
+     * @throws UnknownSubscriberTypeException
+     */
     private function initializeTestResultCache(Configuration $configuration): ResultCache
     {
         if ($configuration->cacheResult()) {
             $cache = new DefaultResultCache($configuration->testResultCacheFile());
 
-            new ResultCacheHandler($cache);
+            new ResultCacheHandler($cache, EventFacade::instance());
 
             return $cache;
         }
 
         return new NullResultCache;
-    }
-
-    private static function exitWithErrorMessage(string $message): never
-    {
-        print Version::getVersionString() . PHP_EOL . PHP_EOL . $message . PHP_EOL;
-
-        exit(Result::EXCEPTION);
-    }
-
-    private static function loadBootstrapScript(string $filename): void
-    {
-        if (!is_readable($filename)) {
-            self::exitWithErrorMessage(
-                sprintf(
-                    'Cannot open bootstrap script "%s"',
-                    $filename
-                )
-            );
-        }
-
-        try {
-            include_once $filename;
-        } catch (Throwable $t) {
-            self::exitWithErrorMessage(
-                sprintf(
-                    'Error in bootstrap script: %s:%s%s%s%s',
-                    $t::class,
-                    PHP_EOL,
-                    $t->getMessage(),
-                    PHP_EOL,
-                    $t->getTraceAsString()
-                )
-            );
-        }
-
-        EventFacade::emitter()->testRunnerBootstrapFinished($filename);
-    }
-
-    private static function buildTestSuite(Configuration $configuration): TestSuite
-    {
-        try {
-            return (new TestSuiteBuilder)->build($configuration);
-        } catch (Exception $e) {
-            self::exitWithErrorMessage($e->getMessage());
-        }
-    }
-
-    private static function bootstrapExtensions(Configuration $configuration, string $extensionClassName, bool $skipTillExtension): void
-    {
-        $extensionBootstrapper = new ExtensionBootstrapper(
-            $configuration,
-            new ExtensionFacade
-        );
-
-        $seenExtensionClassName = $skipTillExtension;
-        foreach ($configuration->extensionBootstrappers() as $bootstrapper) {
-            if (!$seenExtensionClassName || $bootstrapper['className'] === $extensionClassName) {
-                $seenExtensionClassName = true;
-                continue;
-            }
-
-            try {
-                $extensionBootstrapper->bootstrap(
-                    $bootstrapper['className'],
-                    $bootstrapper['parameters']
-                );
-            } catch (\PHPUnit\Runner\Exception $e) {
-                self::exitWithErrorMessage(
-                    sprintf(
-                        'Error while bootstrapping extension: %s',
-                        $e->getMessage()
-                    )
-                );
-            }
-        }
     }
 }
